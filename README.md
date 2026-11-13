@@ -1,145 +1,173 @@
-# 🚀 Proctoring AI: Exam Cheating Detection
+# Proctoring AI: Exam Cheating Detection
 
-An automated, real-time computer vision proctoring system designed to analyze classroom exam video feeds. The system tracks multiple students simultaneously, detects mobile phone usage, estimates gaze directions (looking around), and flags suspicious physical interactions (e.g., passing papers or notes via hand-proximity tracking).
+A computer vision pipeline that analyses wide-angle classroom exam footage and flags suspicious behaviour per student: **phone use**, **looking around**, and **passing paper/notes between neighbours**.
 
-Developed with a modular design, the pipeline runs high-precision object detection, pose estimation, and geometric heuristics to provide clear visual cues of student behavior without complex risk-scoring overhead.
+One corner-mounted camera covers 10+ students at once. Every student gets a persistent track ID, and each frame is annotated with simple rule-based labels. There is no risk score; every label comes straight from a raw signal, so it is always clear why a student was flagged.
 
----
-
-## ✨ Key Features
-
-- **Multi-Student Tracking:** Uses YOLO combined with the **ByteTrack** algorithm to detect students and assign persistent tracking IDs, allowing individual tracking of 10+ students.
-- **Head Pose & Gaze Estimation:** Computes yaw angles using relative nose-to-shoulder or nose-to-eye offsets. Categorizes gaze into `FORWARD`, `SIDE`, `AWAY`, or `FACE_NOT_VISIBLE`.
-- **Hand Proximity Tracking:** Detects physical material sharing by measuring the physical distance between students' wrists relative to their average shoulder width.
-- **Mobile Phone Detection:** Utilizes a custom-trained YOLO model to detect mobile phones and associates them with the nearest tracked student's bounding box.
-- **Multi-Signal Alert Tagging:** Combines raw behavioral signals through strict, rule-based heuristics to display warning flags on the video output:
-  - `PHONE`: Mobile phone detected and associated with the student.
-  - `LOOKING AROUND`: Student gaze directed to the `SIDE` or `AWAY`.
-  - `HAND RISK`: Sustained wrist-proximity between two students cross-checked with their gaze direction (only triggered if at least one student is looking away from their desk to filter out normal synchronized writing).
+<p align="center">
+  <img src="docs/images/hand_risk.jpg" alt="Two students passing a paper across the desk, both flagged HAND RISK and LOOKING AROUND" width="100%">
+  <br><em>Paper passing between ID 2 and ID 6: their wrists stay close for 10+ frames while they look sideways, so both get <code>HAND RISK</code>.</em>
+</p>
 
 ---
 
-## 🛠️ Tech Stack & Dependencies
+## What it detects
 
-The system runs on the **`ai_vision`** Conda environment. Key libraries and frameworks include:
-- **Ultralytics YOLO:** Used for person detection (`yolo26m.pt`), pose estimation (`yolov8m-pose.pt` / `yolo11m-pose.pt`), and custom mobile phone detection (`best11m.pt`).
-- **Supervision (Roboflow):** Handles high-performance video streaming reading/writing (`VideoInfo`, `VideoSink`, `get_video_frames_generator`) and object annotation (`BoxAnnotator`).
-- **OpenCV:** Manages image rendering, text overlays, frame resizing, and GUI displays.
-- **NumPy:** Used for fast spatial calculations and vector operations (e.g., Euclidean distance computation for wrists and head yaw estimation).
+| Label | Colour | Condition |
+|---|---|---|
+| `PHONE` | red | The phone detector finds a phone and assigns it to this student (nearest box centre, ≤ 300 px). |
+| `LOOKING AROUND` | yellow | Head yaw estimated from pose keypoints is `SIDE` (≥ 20°) or `AWAY` (≥ 50°). |
+| `HAND RISK` | yellow | Wrists of two students stay closer than **1.5 × their average shoulder width** for **10 consecutive frames**, *and* at least one of them is looking `SIDE`/`AWAY`. |
+
+The gaze cross-check on `HAND RISK` matters. Without it, two neighbours writing side by side with their hands near each other would be flagged all the time. With it, the label only fires when someone is also turning towards the other person.
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/phone.jpg" alt="Classroom with two students flagged PHONE and several flagged LOOKING AROUND"></td>
+    <td width="50%"><img src="docs/images/hand_risk_2.jpg" alt="A second pair of students in the front row passing a note, flagged HAND RISK"></td>
+  </tr>
+  <tr>
+    <td><em><code>PHONE</code> on ID 5 and ID 9 (red), and <code>LOOKING AROUND</code> on students turned towards their neighbours.</em></td>
+    <td><em>A second pair (ID 11 and ID 7) passing a note in the front row. The earlier pair's counter has reset.</em></td>
+  </tr>
+</table>
 
 ---
 
-## 🏗️ Pipeline & Architecture
-
-Below is the sequence of operations for processing each video frame:
+## How it works
 
 ```mermaid
-flowchart TD
-    A[Input Video Frame] --> B[Person Tracker: YOLO + ByteTrack]
-    B --> C[Extract Bounding Boxes & IDs]
-    C --> D[Crop Person Regions with Padding]
-    D --> E[YOLO-Pose: Keypoint Detection]
-    E --> F[Gaze Direction Estimation]
-    E --> G[Hand Proximity Analysis]
-    C & A --> H[Mobile Phone Detection]
-    H --> I[Associate Phone with Nearest Tracked Person]
-    F & G & I --> J[Rule-Based Signal Fusion]
-    J --> K[Draw Bboxes, IDs & Alert Labels]
-    K --> L[Output Video / Live Preview]
+flowchart LR
+    A[Video frame] --> B[PersonTracker<br/>YOLO + ByteTrack]
+    B -->|TrackedBox list| C[pose_utils<br/>YOLO-Pose on padded crop]
+    C -->|keypoints per ID| D[head_pose_yolo<br/>yaw → gaze direction]
+    C -->|keypoints per ID| E[HandProximityTracker<br/>wrist distance over time]
+    A --> F[detect_phones<br/>fine-tuned YOLO]
+    B --> G[associate_phones<br/>nearest person]
+    F --> G
+    D & E & G --> H[_build_labels<br/>rule-based]
+    H --> I[draw_tracks + draw_alert_labels]
+    I --> J[output/&lt;name&gt;_annotated.mp4]
 ```
 
-1. **Detection & Tracking:** Frame is fed into `PersonTracker` where YOLO locates students and ByteTrack registers their IDs.
-2. **Region Cropping:** To optimize pose estimation, each tracked person's bounding box is cropped with a safety padding.
-3. **Keypoint Extraction:** YOLO-Pose computes 17 COCO keypoints only within the cropped region. The coordinates are then translated back to the full frame space.
-4. **Behavior Analysis:**
-   - **Gaze:** Yaw calculation uses the ratio of nose offset relative to eyes/shoulders.
-   - **Hands:** Wrists are identified; pairwise wrist-to-wrist distances are normalized against average shoulder widths.
-   - **Phones:** Mobile phones are detected on the full frame and mapped to the closest person within a distance threshold.
-5. **Heuristic Alerting:** Warnings are triggered when threshold constraints are violated consecutively (e.g., 10 consecutive frames for hand risk).
+For each frame:
+
+1. **Track people.** `PersonTracker` runs YOLO (`yolo26m.pt`, person class only, `imgsz=1280`) with ultralytics' built-in ByteTrack and returns `TrackedBox(track_id, x1, y1, x2, y2, conf)`.
+2. **Estimate pose once.** `pose_utils` crops each person with 10% padding, runs YOLO-Pose on the crop, and maps the 17 COCO keypoints back to frame coordinates. These keypoints feed both the gaze and the hand modules, so pose inference never runs twice.
+3. **Gaze.** `head_pose_yolo` measures the horizontal offset of the nose from the shoulder midpoint (or the eye midpoint if shoulders are not visible), normalised by shoulder/eye width and scaled to degrees. The result is `FORWARD` (< 20°), `SIDE` (< 50°), `AWAY`, or `FACE_NOT_VISIBLE`.
+4. **Hands.** `HandProximityTracker` takes every pair of students, finds their closest visible wrists, and divides that distance by the pair's average shoulder width. A per-pair counter counts consecutive "close" frames. The pair becomes `is_sustained` at 10 frames, and the counter resets as soon as the wrists move apart or a keypoint disappears.
+5. **Phones.** A separate fine-tuned YOLO (`best11m.pt`, conf ≥ 0.65) runs on the full frame. Each phone is assigned to the nearest tracked student.
+6. **Label and draw.** `main._build_labels()` checks the three conditions above independently. Track boxes are drawn with `supervision`'s `BoxAnnotator`, and the labels are stacked inside each box.
 
 ---
 
-## 📁 Project Structure
+## Project structure
 
 ```
-├── core/
-│   ├── tracker.py          # Person tracking using YOLO & ByteTrack (supervision integrated)
-│   ├── detector.py         # Phone detection and owner assignment logic
-│   ├── pose_utils.py       # Padded person crops & shared YOLO-Pose keypoints extraction
-│   ├── head_pose_yolo.py   # Yaw angle calculation & gaze direction classification
-│   └── hand_proximity.py   # Wrist proximity tracking and temporal thresholding
-├── reporting/
-│   └── visualizer.py       # Rendering of bounding boxes, connecting lines, and alert labels
-├── models/
-│   ├── yolo26m.pt          # Core person detection model weights
-│   ├── yolov8m-pose.pt     # Pose estimation model weights
-│   └── best11m.pt          # Fine-tuned phone detection model weights
-├── tests/
-│   ├── test_tracker.py     # Independent test script for student tracking
-│   ├── test_detector.py    # Independent test script for phone detection
-│   ├── test_head_pose_yolo.py # Independent test script for gaze analysis
-│   ├── test_hand_proximity.py # Independent test script for wrist proximity
-│   └── test_visualizer.py  # Unit/visual test with synthetic bounding boxes
-├── Data/                   # Test videos (Group and Solo folders)
-├── output/                 # Destination folder for annotated output videos
-├── main.py                 # Main orchestration pipeline script
-└── run.py                  # Entry helper script to run the pipeline on test videos
+core/                    # detection logic only, no drawing or video I/O
+  tracker.py             # PersonTracker, TrackedBox, draw_tracks
+  pose_utils.py          # shared YOLO-Pose inference + keypoint indices
+  head_pose_yolo.py      # yaw estimation, GazeDirection
+  hand_proximity.py      # HandProximityTracker (stateful, per-pair counters)
+  detector.py            # detect_phones, associate_phones
+reporting/
+  visualizer.py          # draw_alert_labels, draw_hand_proximity
+tests/                   # per-module demo scripts on real video (cv2.imshow)
+  test_tracker.py  test_detector.py  test_head_pose_yolo.py
+  test_hand_proximity.py  test_visualizer.py (synthetic, no model needed)
+main.py                  # run_pipeline(): wires everything together
+run.py                   # quick launcher with a list of test videos
+docs/images/             # README screenshots
 ```
+
+Not in the repo (git-ignored): `models/` (weights), `Data/` (videos), `output/` (annotated results).
 
 ---
 
-## ⚙️ Installation & Usage
+## Setup
 
-### 1. Environment Setup
-The system requires a conda environment containing the correct versions of OpenCV, PyTorch, and Ultralytics.
+Requirements: Python 3.10+, a CUDA GPU (models are loaded with `.to("cuda")`), and the following packages:
 
 ```bash
-# Activate the dedicated conda environment
+pip install ultralytics supervision opencv-python numpy
+```
+
+The author's environment is the conda env `ai_vision`:
+
+```bash
 conda activate ai_vision
 ```
 
-### 2. Running the Pipeline
-You can run the end-to-end proctoring system using the entry script:
+Put the weights in `models/`:
 
-```bash
-# Run the pipeline on default test footage with a live preview
-python run.py
-```
+| File | Purpose |
+|---|---|
+| `yolo26m.pt` | person detection + tracking |
+| `yolov8m-pose.pt` | pose keypoints |
+| `best11m.pt` | phone detection (fine-tuned YOLO) |
 
-Or run the pipeline programmatically in Python:
+> **Note:** the default model paths in `main.py` and `tests/*.py` are absolute (`E:\Exam  Cheating detection\models\...`). Pass your own paths, or edit the defaults, if your checkout lives somewhere else.
+
+---
+
+## Usage
 
 ```python
 import main
 
-# Run the proctoring pipeline on a specific video
-annotated_video_path = main.run_pipeline(
-    video_path=r"Data\Group\v5\DSC_0080.MOV",
+out = main.run_pipeline(
+    r"Data\Group\v5\DSC_0080.MOV",
     person_model_path=r"models\yolo26m.pt",
     pose_model_path=r"models\yolov8m-pose.pt",
     phone_model_path=r"models\best11m.pt",
-    show_live=True
+    show_live=False,     # True opens a preview window; press q to stop
+    max_frames=None,     # e.g. 60 for a quick smoke test
 )
-print(f"Processed video saved at: {annotated_video_path}")
+print(out)               # output/DSC_0080_annotated.mp4
 ```
 
-### 3. Running Modules Separately
-To test individual modules, execute the scripts in the `tests/` directory:
+Or edit the video list in `run.py` and run:
 
 ```bash
-# Test person tracking
-python tests/test_tracker.py
-
-# Test head pose/gaze direction detection
-python tests/test_head_pose_yolo.py
+python run.py
 ```
+
+To check a single module on a video:
+
+```bash
+python tests/test_tracker.py
+```
+
+```bash
+python tests/test_visualizer.py
+```
+
+`test_visualizer.py` uses synthetic boxes and needs no model.
+
+### Tuning knobs
+
+| Where | Constant | Default |
+|---|---|---|
+| `main.py` | `HAND_DISTANCE_RATIO` | `1.5` |
+| `main.py` | `HAND_CONSECUTIVE_FRAMES` | `10` (frames, so it depends on the video's FPS) |
+| `core/head_pose_yolo.py` | `GazeConfig.side_threshold` / `away_threshold` | `20°` / `50°` |
+| `core/detector.py` | `detect_phones(conf=…)` / `associate_phones(max_distance=…)` | `0.65` / `300 px` |
+| `core/pose_utils.py` | `PoseConfig` keypoint conf / crop padding | `0.3` / `0.1` |
 
 ---
 
-## ⚡ Performance & Hardware Notes
+## Validation
 
-This application has been optimized to maintain high frame rates (FPS) and low memory usage under hardware constraints (such as mid-range or entry-level CUDA-enabled GPUs):
+Labelled clips for each behaviour (phone use, looking around, paper passing, copying) are used **only as ground truth for checking results, never for training**. Evaluation is qualitative: known videos are run through the pipeline, and the annotated output is reviewed by hand for false positives and misses. There are no precision/recall numbers yet.
 
-1. **Cropped Region Inference (Pose Optimization):** Rather than passing high-resolution full video frames to the YOLO-Pose model, `pose_utils.py` crops a tight window around each tracked student (with safety padding) and passes only the cropped sub-image. This results in significantly faster inference times and a lower memory footprint.
-2. **Inference Sharing:** Keypoints are computed once per person per frame and shared between both the head pose classifier and the hand-proximity tracker, preventing redundant model execution.
-3. **Frame-Skipping Option:** Visual test scripts (such as `tests/test_tracker.py`) support a `frame_skip` parameter (e.g., updating tracking every 2nd or 3rd frame). This reduces processing overhead for testing and ensures smooth display feedback on slower machines.
-4. **CUDA Offloading:** Main scripts explicitly load the PyTorch weights on CUDA (GPU) devices via `.to("cuda")` to prevent CPU bottlenecks.
+## Known limitations
+
+- **Small phones.** At this camera distance a phone is about 15–25 px, so phones are easy to miss. A crop-based second pass or SAHI slicing is the planned fix.
+- **`LOOKING AROUND` is noisy.** Yaw comes from a 2D nose offset, so a student leaning over the paper or talking to the side also triggers it (see the screenshots above).
+- **ID switches.** ByteTrack can reassign an ID after occlusion (for example, a student reappearing with a new ID), which resets the hand-proximity counter for that pair.
+- **Frame-based timing.** The 10-frame window is not converted to seconds, so the effective duration depends on FPS.
+- **`copying` is not detected** as its own label yet.
+
+## Future work
+
+Seat mapping, an instructor dashboard, audio-based talking detection, face blurring for privacy, and edge-device optimisation.
